@@ -1,3 +1,4 @@
 .env
 myserver
 out
+main_test.go

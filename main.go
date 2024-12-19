@@ -24,6 +24,7 @@ type apiHandler struct{}
 type apiConfig struct {
 	fileserverHits atomic.Int32
 	DB             *database.Queries
+	jwtSecret      string
 }
 
 type User struct {
@@ -32,6 +33,8 @@ type User struct {
 	UpdatedAt      time.Time `json:"updated_at"`
 	Email          string    `json:"email"`
 	HashedPassword string    `json:"-"` // - means do not include this field in client JSON responses.
+	Token          string    `json:"token"`
+	RefreshToken   string    `json:"refresh_token"`
 }
 
 type Chirp struct {
@@ -167,25 +170,29 @@ func (cfg *apiConfig) chirpHandler(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 
 		type parameters struct {
-			// these tags indicate how the keys in the JSON should be mapped to the struct fields
-			// the struct fields must be exported (start with a capital letter) if you want them parsed
-			Body   string `json:"body"`
-			UserID string `json:"user_id"`
+			Body string `json:"body"`
+		}
+
+		token, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			log.Printf("Unauthorized access: %s", err)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+
+		userID, err := auth.ValidateJWT(token, cfg.jwtSecret)
+		if err != nil {
+			log.Printf("Unauthorized access: %s", err)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
 		}
 
 		decoder := json.NewDecoder(r.Body)
 		params := parameters{}
-		err := decoder.Decode(&params)
+		err = decoder.Decode(&params)
 		if err != nil {
 			// an error will be thrown if the JSON is invalid or has the wrong types
 			// any missing fields will simply have their values in the struct set to their zero value
-			log.Printf("Error decoding parameters: %s", err)
-			w.WriteHeader(500)
-			return
-		}
-
-		userID, err := uuid.Parse(params.UserID)
-		if err != nil {
 			log.Printf("Error decoding parameters: %s", err)
 			w.WriteHeader(500)
 			return
@@ -214,7 +221,7 @@ func (cfg *apiConfig) chirpHandler(w http.ResponseWriter, r *http.Request) {
 				CreatedAt: chirp.CreatedAt,
 				UpdatedAt: chirp.UpdatedAt,
 				Body:      chirp.Body,
-				UserID:    chirp.UserID,
+				UserID:    userID,
 			}
 
 			w.Header().Set("Content-Type", "application/json")
@@ -229,7 +236,7 @@ func (cfg *apiConfig) chirpHandler(w http.ResponseWriter, r *http.Request) {
 
 }
 
-// the anti-american constitution going on here is absurd and should be abolished immediately!
+// the anti-american constitution goings on here is absurd and should be abolished immediately!
 
 func restrictFreeSpeech(body string) string {
 	restrictedBody := body
@@ -253,6 +260,7 @@ func restrictFreeSpeech(body string) string {
 
 func (cfg *apiConfig) userHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
+	case http.MethodPut:
 
 	case http.MethodPost:
 
@@ -332,11 +340,41 @@ func (cfg *apiConfig) loginHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		expiresIn := time.Hour // default 1 hour
+
+		accessToken, err := auth.MakeJWT(getUser.ID, cfg.jwtSecret, expiresIn)
+		if err != nil {
+			http.Error(w, "Error creating token", http.StatusInternalServerError)
+			return
+		}
+
+		refreshToken, err := auth.MakeRefreshToken()
+		if err != nil {
+			http.Error(w, "Error creating refresh token", http.StatusInternalServerError)
+			return
+		}
+
+		expiresAt := time.Now().AddDate(0, 0, 60) // 60 days from now
+
+		rtParams := database.StoreRefreshTokenParams{
+			Token:     refreshToken,
+			UserID:    uuid.NullUUID{UUID: getUser.ID, Valid: true},
+			ExpiresAt: sql.NullTime{Time: expiresAt, Valid: true},
+		}
+
+		storedRefreshToken, err := cfg.DB.StoreRefreshToken(r.Context(), rtParams)
+		if err != nil {
+			http.Error(w, "Error storing refresh token", http.StatusInternalServerError)
+			return
+		}
+
 		response := User{
-			ID:        getUser.ID,
-			CreatedAt: getUser.CreatedAt,
-			UpdatedAt: getUser.UpdatedAt,
-			Email:     getUser.Email,
+			ID:           getUser.ID,
+			CreatedAt:    getUser.CreatedAt,
+			UpdatedAt:    getUser.UpdatedAt,
+			Email:        getUser.Email,
+			Token:        accessToken,
+			RefreshToken: storedRefreshToken.Token,
 		}
 
 		data, err := json.Marshal(response)
@@ -369,8 +407,10 @@ func main() {
 	}
 	dbQueries := database.New(db)
 
+	// api config
 	apiCfg := &apiConfig{
-		DB: dbQueries,
+		DB:        dbQueries,
+		jwtSecret: os.Getenv("JWT_SECRET"),
 	}
 
 	// chirpy server code
@@ -382,6 +422,8 @@ func main() {
 	mux.HandleFunc("/admin/metrics", apiCfg.metricsHandler)
 	mux.HandleFunc("/admin/reset", apiCfg.resetHandler)
 	mux.HandleFunc("/api/chirps", apiCfg.chirpHandler)
+	mux.HandleFunc("/api/refresh", apiCfg.refreshHandler)
+	mux.HandleFunc("/api/revoke", apiCfg.revokedHandler)
 	mux.HandleFunc("/api/chirps/{chirpID}", apiCfg.queryHandler)
 	fileServer := http.StripPrefix("/app", http.FileServer(http.Dir(".")))
 	mux.Handle("/app/", apiCfg.middlewareMetricsInc(fileServer))
@@ -394,6 +436,85 @@ func main() {
 	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
 		// Error starting or closing listener:
 		log.Fatalf("HTTP server ListenAndServe: %v", err)
+	}
+
+}
+
+func (cfg *apiConfig) revokedHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+
+		// Extract refresh token from request header
+		refreshToken, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			log.Printf("Unauthorized refresh access: %s", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		// Revoke token here
+
+		_, err = cfg.DB.RevokeToken(r.Context(), refreshToken)
+		if err != nil {
+			http.Error(w, "Unabled to revoke token", http.StatusUnauthorized)
+			return
+		}
+
+		w.WriteHeader(http.StatusNoContent)
+
+	default:
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+}
+
+func (cfg *apiConfig) refreshHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+
+		// Extract refresh token from request header
+		refreshToken, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			log.Printf("Could not find token: %s", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		// Check that the token exists in your data store
+		user, err := cfg.DB.GetUserFromRefreshToken(r.Context(), refreshToken)
+		if err != nil {
+			http.Error(w, "Invalid or missing refresh token", http.StatusUnauthorized)
+			return
+		}
+
+		// Issue a new access token
+		newAccessToken, err := auth.MakeJWT(user.ID, cfg.jwtSecret, time.Hour)
+		if err != nil {
+			http.Error(w, "Error creating new token", http.StatusInternalServerError)
+			return
+		}
+
+		// Respond with the new access token
+		response := struct {
+			Token string `json:"token"`
+		}{
+			Token: newAccessToken,
+		}
+
+		data, err := json.Marshal(response)
+		if err != nil {
+			http.Error(w, "Error encoding response", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write(data)
+
+	default:
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
 	}
 
 }
